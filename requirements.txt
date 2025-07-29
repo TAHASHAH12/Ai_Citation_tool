@@ -1,0 +1,7 @@
+streamlit 
+openai 
+pandas 
+plotly 
+dataforseo-client 
+numpy 
+scipy
