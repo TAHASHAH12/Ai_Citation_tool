@@ -5,3 +5,4 @@ plotly
 dataforseo-client 
 numpy 
 scipy
+tldextract
