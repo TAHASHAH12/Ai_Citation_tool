@@ -806,80 +806,424 @@ Respond with only one word: positive, neutral, or negative"""
     except Exception as e:
         return 'Neutral'  # Default to neutral if analysis fails
 
-# Extract brand mentions with more variety
+import json
+from openai import OpenAI
+
+import json
+import re
+def _extract_json_from_text(text):
+    """Extract a JSON object or array from model output."""
+    text = text.strip()
+    # Look for code fences first
+    m = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
+    if m:
+        candidate = m.group(1).strip()
+        if candidate.startswith('{') or candidate.startswith('['):
+            return candidate
+
+    # If full object present
+    start_obj = text.find('{')
+    end_obj = text.rfind('}')
+    if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+        return text[start_obj:end_obj+1]
+
+    # If full array present
+    start_arr = text.find('[')
+    end_arr = text.rfind(']')
+    if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+        return text[start_arr:end_arr+1]
+
+    raise ValueError("No JSON array or object found in assistant response")
+
+
+def _safe_json_load(s, client=None, mdl=None):
+    """
+    Try to parse JSON string 's'. If it fails, sanitize common issues
+    and retry. If still failing and client provided, ask the model to fix it.
+    """
+    import json, re
+    try:
+        return json.loads(s)
+    except Exception:
+        # Fix common broken JSON issues
+
+        # 1) Remove trailing commas
+        s2 = re.sub(r',\s*([\]}])', r'\1', s)
+
+        # 2) Escape unescaped quotes inside strings
+        # Fix unquoted keys: turn {key: value} into {"key": value}
+        s2 = re.sub(r'([{,]\s*)([A-Za-z0-9_]+)(\s*:\s*)', r'\1"\2"\3', s2)
+
+        # 3) Ensure it ends properly (optional: pad closing bracket)
+        if s2.count('[') > s2.count(']'):
+            s2 += ']'
+        if s2.count('{') > s2.count('}'):
+            s2 += '}'
+
+        try:
+            return json.loads(s2)
+        except Exception as e2:
+            if client and mdl:
+                try:
+                    # Last-ditch: ask model to fix broken JSON
+                    fix_prompt = f"Fix the following broken JSON so it is valid. Return ONLY valid JSON, nothing else:\n\n{s}"
+                    fix_resp = client.chat.completions.create(
+                        model=mdl,
+                        messages=[
+                            {"role": "system", "content": "You are a JSON fixer."},
+                            {"role": "user", "content": fix_prompt}
+                        ],
+                        temperature=0
+                    )
+                    fixed_text = fix_resp.choices[0].message.content.strip()
+                    return json.loads(fixed_text)
+                except Exception as e3:
+                    raise e3
+            else:
+                raise e2
+
+def is_brand_domain(domain, brand):
+    if not domain or not brand:
+        return False
+    domain = domain.lower()
+    brand = brand.lower()
+    return brand in domain.split(".")[0]
+
+from urllib.parse import urlparse
+
+def _domain_from_url(url):
+    try:
+        parsed = urlparse(url if url.startswith('http') else 'http://' + url)
+        net = parsed.netloc or parsed.path
+        return net.lower().lstrip('www:')
+    except Exception:
+        return None
+
+def _brand_domain_candidate(brand):
+    """
+    Convert 'stake.com' or 'Stake' -> 'stake.com' (best-effort).
+    Prefer to keep existing canonical brand string if it's already a domain.
+    """
+    b = brand.strip().lower()
+    # If it already looks like a domain, return it
+    if re.match(r'[a-z0-9-]+\.[a-z]{2,}', b):
+        return b
+    # otherwise assume brand -> brand.com (safe fallback only when explicitly cited)
+    token = re.sub(r'[^\w-]', '', b.split('.')[0])
+    return f"{token}.com" if token else None
+
+
+def _normalize_source_text_to_domain(text):
+    match = re.search(r'([a-zA-Z0-9-]+\.[a-z]{2,})', text)
+    return match.group(1).lower() if match else None
+
+
 def extract_mentions_and_citations(response_text, target_brands, client=None):
-    """Extract brand mentions with more varied citation sources"""
+    """
+    Use the OpenAI model to extract mentioned brands and their cited domains
+    from the AI response main body (before Sources/Citations). If model-based
+    extraction fails, fall back to a conservative regex-based extractor.
+    Returns a list of mention dicts with keys:
+    mentioned_brand, mention_text, citation_domain, citation_text,
+    citation_type, citation_ref, context, sentiment, position
+    """
     mentions_data = []
-    
     if not response_text:
         return mentions_data
+
+    # 1) get main_body (everything before Sources: or Citations:)
+    parts = re.split(r'(?is)\b(?:sources|citations)\s*:\s*', response_text, maxsplit=1)
+    main_body = parts[0].strip()
+
+    # Build the extraction prompt
+    system_prompt = (
+    "You are a precise data extractor. Given a piece of text (the MAIN BODY of an AI response), "
+    "extract ALL mentions of brands, companies, platforms, casinos, and competitors, "
+    "not only from the provided target list but also any others that appear in the text. "
+    "For each mention, identify the cited domain(s) that support that mention, "
+    "using evidence from inline links, numbered references, or explicit domain mentions in text. "
+    "Return a JSON array (only JSON) where each item has these keys:\n"
+    " - mentioned_brand: the brand/company/platform/casino/competitor as found in the main body\n"
+    " - mention_text: the exact substring containing the mention\n"
+    " - citation_domain: the domain (e.g., trustpilot.com, coindesk.com) that supports this mention. If numbered citation [n] or [^n^], check sources or citations section for the domain.\n"
+    " - citation_text: the raw citation text or URL associated with that domain\n"
+    " - citation_type: one of NumberedReference, InlineLink, DetectedURL, DetectedDomainText, or Fallback\n"
+    " - citation_ref: numeric ref like '7' if present, otherwise null\n"
+    " - context: up to ~200 chars around the mention\n"
+    " - sentiment: positive, neutral, or negative (if extractable)\n"
+    " - position: character index (0-based) of mention_text within the main body\n\n"
+    "If a single brand mention is supported by multiple distinct cited domains, output one object per (brand,domain). "
+    "Do not fabricate citations."
+    "When extracting 'citation_domain':\n"
+    "- If the brand mention is followed by a numbered citation [n] or [^n^], match the domain from the Sources/Citations section.\n"
+    "- If there is no numbered citation but the text explicitly mentions a source (e.g., 'Source: Brand's official website', 'on LinkedIn', 'according to Twitter'), infer the correct domain.\n"
+    "- The domain must be normalized to its registrable form (e.g., 'stake.com', 'linkedin.com', 'twitter.com').\n"
+    "- Always return 'citation_type' as:\n"
+    "  - 'NumberedReference' if it came from [n] or [^n^]\n"
+    "  - 'InlineLink' if it's an inline clickable link\n"
+    "  - 'ImpliedSource' if inferred from natural language without a numbered reference\n"
+    "Return your result inside an object with key 'data' whose value is the JSON array."
+    "Return ONLY JSON, no explanations or extra text."
+    "Return your result as a JSON object with a key 'data' whose value is the JSON array of extracted mentions."
+    "Return ONLY JSON, no explanations or extra text."
+    )
+
+    user_prompt = f"""Main body:
+{main_body}
+
+Target brands (ensure these are included if present, but also include ANY other brands, competitors, platforms, or casinos mentioned in the text):
+{', '.join(target_brands)}
+
+Return ONLY a JSON array as described."""
+    # Call the model (deterministic)
+    model_names_to_try = ["gpt-4o","gpt-4o-mini","gpt-4o-turbo"]
+    model_tried = None
+    assistant_text = None
+
+    if client:
+        for mdl in model_names_to_try:
+            try:
+                model_tried = mdl
+                resp = client.chat.completions.create(
+                    model=mdl,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0,
+                    max_tokens=1200,
+                    response_format={"type": "json_object"}  
+                )
+                # correct access to assistant text
+                assistant_text = resp.choices[0].message.content
+                break
+            except Exception as e:
+                # try next model
+                assistant_text = None
+                last_exc = e
+        if assistant_text is None:
+            # log and fall through to regex fallback
+            print(f"OpenAI extraction failed after trying models {model_names_to_try}: {last_exc}")
+    else:
+        print("No OpenAI client provided - skipping model extraction and using fallback.")
     
-    # More varied citation sources
-    citation_sources = [
-        'reddit.com', 'youtube.com', 'trustpilot.com', 'askgamblers.com',
-        'casino.guru', 'coindesk.com', 'techcrunch.com', 'forbes.com',
-        'twitter.com', 'linkedin.com', 'medium.com', 'quora.com',
-        'bloomberg.com', 'reuters.com', 'cnet.com', 'theverge.com'
-    ]
-    
+    # If assistant returned something, try to extract JSON
+    parsed_items = None
+    if assistant_text:
+        try:
+            json_blob = _extract_json_from_text(assistant_text)
+            parsed = _safe_json_load(json_blob)
+            parsed_items = parsed.get("data", []) if isinstance(parsed, dict) else parsed
+            if not isinstance(parsed_items, list):
+                raise ValueError("Parsed JSON is not a list")
+        except Exception as e:
+            print(f"Failed to parse JSON from assistant response (model {model_tried}): {e}")
+            parsed_items = None
+
+    # If model extraction succeeded, normalize and return items
+    if parsed_items is not None:
+        for item in parsed_items:
+            try:
+                # normalize fields; compute fallback position if missing
+                mention_text = item.get("mention_text") or item.get("mentioned_brand") or ""
+                brand = item.get("mentioned_brand", "").strip()
+                domain = item.get("citation_domain")
+                citation_type = item.get("citation_type")
+                
+                if is_brand_domain(domain, brand):
+                    if citation_type not in ("NumberedReference", "InlineLink"):
+                        continue
+                # compute position in main_body if model didn't provide it
+                pos = item.get("position")
+                if pos is None:
+                    # find first occurrence of mention_text; if not found, set -1
+                    if mention_text:
+                        mpos = main_body.find(mention_text)
+                        pos = mpos if mpos >= 0 else 0
+                    else:
+                        pos = 0
+                sentiment = item.get("sentiment")
+                if not sentiment:
+                    # compute sentiment if missing
+                    sentiment = classify_sentiment(client, item.get("context", ""), item.get("mentioned_brand", "")) if client else "Neutral"
+
+                mentions_data.append({
+                    "mentioned_brand": item.get("mentioned_brand", "").strip(),
+                    "mention_text": mention_text,
+                    "citation_domain": item.get("citation_domain"),
+                    "citation_text": item.get("citation_text"),
+                    "citation_type": item.get("citation_type"),
+                    "citation_ref": item.get("citation_ref"),
+                    "context": item.get("context")[:400] if item.get("context") else "",
+                    "sentiment": sentiment,
+                    "position": int(pos)
+                })
+            except Exception as e:
+                # skip malformed item but continue
+                print(f"Skipping malformed item from model output: {e}")
+        return mentions_data
+
+    # -------------------------
+    # FALLBACK: conservative regex-based extractor (only used if model failed)
+    # (This is your old logic with improvements: numbered refs and inline URLs & plain domains)
+    # -------------------------
+    print("Falling back to regex-based extraction")
+
+    # Parse the sources/citations area to a ref_map like before
+    ref_map = {}
+    ref_text_map = {}
+    sources_match = re.search(r'(?is)\b(?:sources|citations)\s*:\s*(.*)$', response_text)
+    sources_section = sources_match.group(1).strip() if sources_match else ""
+    if sources_section:
+        for line in sources_section.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            # Match [n], n., or [^n^]
+            numbered = re.match(r'^(?:\[(\d+)\]|\[\^(\d+)\^\]|(\d+)\.)\s*(.*)$', line)
+            if not numbered:
+                continue
+
+            ref_num = numbered.group(1) or numbered.group(2) or numbered.group(3)
+            src_text = numbered.group(4).strip()
+
+            urls = re.findall(r'https?://[^\s\)]+', src_text)
+            if urls:
+                domain = _domain_from_url(urls[0])
+                ref_map[ref_num] = {"domain": domain, "url": urls[0]}
+            else:
+                # fallback: detect plain domain in text
+                domain = _normalize_source_text_to_domain(src_text)
+                ref_map[ref_num] = {"domain": domain, "url": None}
+
+    dedupe_set = set()
     for brand in target_brands:
-        brand_clean = brand.replace('.com', '').replace('.org', '').replace('.net', '')
-        
-        # Enhanced brand mention detection
-        brand_patterns = [
-            rf'\b{re.escape(brand_clean)}\b',
-            rf'\b{re.escape(brand_clean.title())}\b',
-            rf'\b{re.escape(brand_clean.upper())}\b',
-            rf'\b{re.escape(brand)}\b'
-        ]
-        
-        all_matches = []
-        for pattern in brand_patterns:
-            matches = list(re.finditer(pattern, response_text, re.IGNORECASE))
-            all_matches.extend(matches)
-        
-        # Remove duplicate matches
+        brand_clean = re.sub(r'\.(com|org|net|io|co)$', '', brand, flags=re.IGNORECASE)
+        patterns = [rf'\b{re.escape(brand_clean)}\b', rf'\b{re.escape(brand)}\b']
+        matches = []
+        for p in patterns:
+            matches.extend(list(re.finditer(p, main_body, re.IGNORECASE)))
+        seen = set()
         unique_matches = []
-        seen_positions = set()
-        for match in all_matches:
-            if match.start() not in seen_positions:
-                unique_matches.append(match)
-                seen_positions.add(match.start())
-        
+        for m in matches:
+            if m.start() not in seen:
+                unique_matches.append(m)
+                seen.add(m.start())
         for match in unique_matches:
-            # Get context
-            start = max(0, match.start() - 150)
-            end = min(len(response_text), match.end() + 150)
-            context = response_text[start:end].strip()
-            
-            # More varied citation source selection
-            citation_domain = brand  # Default
-            
-            context_lower = context.lower()
-            # Weighted random selection for more variety
-            source_weights = []
-            for source in citation_sources:
-                weight = 2 if source.replace('.com', '') in context_lower else 1
-                source_weights.extend([source] * weight)
-            
-            if source_weights:
-                citation_domain = random.choice(source_weights)
-            
-            # Classify sentiment
-            sentiment = classify_sentiment(client, context, brand_clean)
-            
-            mentions_data.append({
-                'mentioned_brand': brand,
-                'mention_text': match.group(),
-                'citation_domain': citation_domain,
-                'citation_text': match.group(),
-                'citation_type': 'Brand Mention',
-                'context': context,
-                'sentiment': sentiment,
-                'position': match.start()
-            })
-    
+            window_start = max(0, match.start() - 200)
+            window_end = min(len(main_body), match.end() + 200)
+            context = main_body[window_start:window_end].strip()
+
+            # numbered refs in context
+            ref_nums = re.findall(r'\[(\d+)\]', context)
+            if ref_nums:
+                for rn in ref_nums:
+                    dom = ref_map.get(rn)
+                    citation_text = ref_text_map.get(rn)
+                    if not dom:
+                        # try to detect domain-like token in citation_text or default
+                        dom = citation_text.split('//',1)[-1].split('/',1)[0] if citation_text else f"{brand_clean}.com"
+                    key = (brand.lower(), dom, match.start(), rn)
+                    if key in dedupe_set:
+                        continue
+                    dedupe_set.add(key)
+                    sentiment = classify_sentiment(client, context, brand_clean) if client else "Neutral"
+                    mentions_data.append({
+                        "mentioned_brand": brand,
+                        "mention_text": match.group(),
+                        "citation_domain": dom,
+                        "citation_text": citation_text,
+                        "citation_type": "NumberedReference",
+                        "citation_ref": rn,
+                        "context": context,
+                        "sentiment": sentiment,
+                        "position": match.start()
+                    })
+                continue
+
+            # inline markdown URLs
+            inline_urls = re.findall(r'\[.*?\]\((https?://[^\)]+)\)', context)
+            if inline_urls:
+                for u in inline_urls:
+                    dom = u.split('//',1)[1].split('/',1)[0].lower().lstrip('www.')
+                    key = (brand.lower(), dom, match.start(), u)
+                    if key in dedupe_set:
+                        continue
+                    dedupe_set.add(key)
+                    sentiment = classify_sentiment(client, context, brand_clean) if client else "Neutral"
+                    mentions_data.append({
+                        "mentioned_brand": brand,
+                        "mention_text": match.group(),
+                        "citation_domain": dom,
+                        "citation_text": u,
+                        "citation_type": "InlineLink",
+                        "citation_ref": None,
+                        "context": context,
+                        "sentiment": sentiment,
+                        "position": match.start()
+                    })
+                continue
+
+            # plain http(s) URL(s)
+            plain_urls = re.findall(r'https?://([A-Za-z0-9.-]+\.[A-Za-z]{2,})', context)
+            if plain_urls:
+                for dom in plain_urls:
+                    dom_clean = dom.lower().lstrip('www.')
+                    key = (brand.lower(), dom_clean, match.start(), dom)
+                    if key in dedupe_set:
+                        continue
+                    dedupe_set.add(key)
+                    sentiment = classify_sentiment(client, context, brand_clean) if client else "Neutral"
+                    mentions_data.append({
+                        "mentioned_brand": brand,
+                        "mention_text": match.group(),
+                        "citation_domain": dom_clean,
+                        "citation_text": f"https://{dom}",
+                        "citation_type": "DetectedURL",
+                        "citation_ref": None,
+                        "context": context,
+                        "sentiment": sentiment,
+                        "position": match.start()
+                    })
+                continue
+
+            # plain domain text in context (e.g., techcrunch.com, reddit.com)
+            text_domains = re.findall(r'\b([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b', context)
+            if text_domains:
+                for dom in text_domains:
+                    dom_clean = dom.lower().lstrip('www.')
+                    key = (brand.lower(), dom_clean, match.start(), dom)
+                    if key in dedupe_set:
+                        continue
+                    dedupe_set.add(key)
+                    sentiment = classify_sentiment(client, context, brand_clean) if client else "Neutral"
+                    mentions_data.append({
+                        "mentioned_brand": brand,
+                        "mention_text": match.group(),
+                        "citation_domain": dom_clean,
+                        "citation_text": dom,
+                        "citation_type": "DetectedDomainText",
+                        "citation_ref": None,
+                        "context": context,
+                        "sentiment": sentiment,
+                        "position": match.start()
+                    })
+                continue
+
+            # final fallback: do NOT use brandname.com unless explicitly requested;
+            # here we skip adding a fallback domain to avoid false attribution
+            # (if you want fallback behavior, uncomment the fallback block)
+            # fallback_domain = f"{brand_clean}.com"
+            # if (brand.lower(), fallback_domain, match.start(), 'fallback') not in dedupe_set:
+            #     dedupe_set.add((brand.lower(), fallback_domain, match.start(), 'fallback'))
+            #     sentiment = classify_sentiment(client, context, brand_clean) if client else "Neutral"
+            #     mentions_data.append({...})
+            # For now, if nothing is found we do not append anything for this mention.
+
     return mentions_data
+
+
 
 # Create real-time processing display
 def create_processing_display(tracker, processing_placeholder):
