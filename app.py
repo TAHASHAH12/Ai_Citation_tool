@@ -299,46 +299,97 @@ def init_openai_client():
         st.error(f"OpenAI client initialization failed: {str(e)}")
         return None
 
+
+# === Input normalization and validation helpers (ADDED) ===
+import unicodedata
+EMOJI_PATTERN = re.compile(r'[\U00010000-\U0010ffff]', flags=re.UNICODE)
+
+def strip_emojis(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    return EMOJI_PATTERN.sub('', text)
+
+def normalize_text_basic(text: str) -> str:
+    text = text or ""
+    text = strip_emojis(text)
+    # Normalize diacritics to ASCII
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    return text.strip()
+
+def normalize_domain(text: str) -> str:
+    text = normalize_text_basic(text).lower()
+    # keep only valid domain chars
+    text = re.sub(r'[^a-z0-9\.\-]', '', text)
+    text = text.lstrip('www.')
+    return text
+
+DOMAIN_RE = re.compile(r'^(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$')
+
+def is_valid_domain(domain: str) -> bool:
+    if not domain:
+        return False
+    return bool(DOMAIN_RE.match(domain))
+
+def is_meaningful_input(text: str, min_chars: int = 2) -> bool:
+    if not text:
+        return False
+    text = normalize_text_basic(text)
+    # remove punctuation and spaces
+    letters = re.sub(r'[^A-Za-z0-9]', '', text)
+    return len(letters) >= min_chars
+
+PLACEHOLDER_PATTERNS = [
+    re.compile(r'^competitor\d+\.(com|net|org)$'),
+    re.compile(r'^example\.(com|net|org)$'),
+    re.compile(r'placeholder'),
+    re.compile(r'yourbrand'),
+    re.compile(r'brand(name)?'),
+    re.compile(r'^test\d*\.(com|net|org)$')
+]
+
+def filter_realistic_domains(domains):
+    cleaned = []
+    for d in domains:
+        d = normalize_domain(d)
+        if not is_valid_domain(d):
+            continue
+        # remove placeholders
+        if any(p.search(d) for p in PLACEHOLDER_PATTERNS):
+            continue
+        cleaned.append(d)
+    # de-dup
+    return sorted(set(cleaned))
+
+def normalize_query_string(q: str) -> str:
+    return ' '.join((q or '').lower().split())
 # Discover competitors using AI
 def discover_competitors_ai(client, brand, industry_description=""):
-    """Discover competitors using AI"""
+    """Discover competitors using AI (returns realistic domains or empty)"""
     if not client:
         return []
-    
-    prompt = f"""List 5 direct competitors of {brand} in the {industry_description} industry.
-    
-    Requirements:
-    - Only provide domain names (e.g., competitor.com)
-    - One domain per line
-    - No explanations
-    
-    Brand: {brand}
-    Industry: {industry_description}
-    
-    Output format: domain names only, one per line."""
-    
+    # Normalize inputs
+    brand = normalize_domain(brand)
+    industry_description = normalize_text_basic(industry_description)
+    prompt = f"List 5 direct competitors (domains only) of {brand or 'the given brand'} in the {industry_description or 'specified'} industry.\n- Output ONLY domains (like example.com), one per line.\n- If you are not confident or can't find real competitors, return an EMPTY list."
     try:
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You are a competitive intelligence expert. Provide accurate competitor domain names."},
+                {"role": "system", "content": "You are careful and conservative. Only provide realistic competitor domains. If uncertain, provide none."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=200,
-            temperature=0.3,
+            temperature=0.2,
             timeout=20
         )
-        
-        competitors = [comp.strip().lower() 
-                      for comp in response.choices[0].message.content.strip().split('\n') 
-                      if comp.strip() and '.' in comp.strip()]
-        
-        return competitors[:5]
-    
+        raw = [comp.strip() for comp in response.choices[0].message.content.strip().splitlines() if comp.strip()]
+        domains = [normalize_domain(c) for c in raw if '.' in c]
+        domains = filter_realistic_domains(domains)[:5]
+        return domains
     except Exception as e:
         st.error(f"Error discovering competitors: {str(e)}")
         return []
-
 # Funnel stages configuration
 FUNNEL_STAGES = {
     "Awareness": {
@@ -1050,7 +1101,7 @@ Return ONLY a JSON array as described."""
                 mentions_data.append({
                     "mentioned_brand": item.get("mentioned_brand", "").strip(),
                     "mention_text": mention_text,
-                    "citation_domain": item.get("citation_domain"),
+                    "citation_domain": (normalize_domain(item.get("citation_domain") or "") or (normalize_domain(item.get("mentioned_brand") or "") if (item.get("citation_text") or "").lower().find("official")>=0 else "")),
                     "citation_text": item.get("citation_text"),
                     "citation_type": item.get("citation_type"),
                     "citation_ref": item.get("citation_ref"),
@@ -1623,6 +1674,15 @@ def display_keyword_scoring_dashboard(keyword_scorer, brand, competitors):
             st.success("🎉 No missed opportunities found! Your brand is well-represented across all relevant keywords.")
 
 # Enhanced query results display with complete details
+
+def _is_verified_citation(item: dict) -> bool:
+    ctype = (item.get('citation_type') or '').lower()
+    text = item.get('citation_text') or ''
+    if ctype in ('inlinelink', 'detectedurl'):
+        return True
+    if ctype == 'numberedreference' and ('http://' in text or 'https://' in text):
+        return True
+    return False
 def display_enhanced_query_results(generated_queries, brand, query_details_data=None):
     """Display enhanced query results with complete prompt, response, mentions, and citations"""
     st.markdown("## 🎯 Enhanced Query Details with Complete Analysis")
@@ -1678,7 +1738,7 @@ def display_enhanced_query_results(generated_queries, brand, query_details_data=
                 # Show AI platform responses with complete details
                 if query_details_data:
                     query_matches = [detail for detail in query_details_data 
-                                   if detail['query'].lower() == query.lower() and detail['stage'] == stage_name]
+                                   if normalize_query_string(detail['query']) == normalize_query_string(query) and detail['stage'] == stage_name]
                     
                     if query_matches:
                         for platform_data in query_matches:
@@ -1758,11 +1818,23 @@ def display_enhanced_query_results(generated_queries, brand, query_details_data=
                                     for domain in citation_domains:
                                         domain_citations = [c for c in citations if c['citation_domain'] == domain]
                                         
+                                        # Build clickable links if LLM provided any URLs in citation text/ref
+                                        _urls = []
+                                        for _c in domain_citations:
+                                            _txt = f"{_c.get('citation_text') or ''} {_c.get('citation_ref') or ''}"
+                                            _urls += re.findall(r'(https?://[^\s\)\]]+)', _txt)
+                                        # Dedupe while preserving order
+                                        seen = set()
+                                        _urls = [u for u in _urls if not (u in seen or seen.add(u))]
+                                        links_html = ""
+                                        if _urls:
+                                            links_html = "<br><strong>Links:</strong> " + " | ".join([f'<a href="{u}" target="_blank" rel="noopener noreferrer">{u}</a>' for u in _urls[:5]])
                                         st.markdown(f"""
                                         <div class="citation-badge" style="display: block; margin: 0.5rem 0;">
                                             <strong>Source:</strong> {domain}<br>
                                             <strong>Citations:</strong> {len(domain_citations)}<br>
-                                            <strong>Type:</strong> {domain_citations[0].get('citation_type', 'Unknown')}
+                                            <strong>Type:</strong> {domain_citations[0].get('citation_type', 'Unknown')}<br>
+                                            {links_html}
                                         </div>
                                         """, unsafe_allow_html=True)
                                     
@@ -2013,8 +2085,7 @@ def main():
                         st.error("AI competitor discovery requires OpenAI client")
                         competitors = []
                 
-                competitors = getattr(st.session_state, 'discovered_competitors', 
-                                    ["bet365.com", "roobet.com", "duelbits.com", "leovegas.com", "888casino.com"])
+                competitors = getattr(st.session_state, 'discovered_competitors', [])
         
         # Seed keywords
         with st.expander("🌱 Seed Keywords", expanded=True):
@@ -2107,6 +2178,27 @@ def main():
     
     # Main analysis execution
     if start_analysis:
+        # === Strong input validation (ADDED) ===
+        # Normalize brand and competitors
+        brand = normalize_domain(brand)
+        if not is_valid_domain(brand) or not is_meaningful_input(brand, 2):
+            st.error("❌ Please enter a valid brand domain (e.g., example.com). Single-character or invalid values are not allowed.")
+            return
+        # Validate industry: allow empty, but if present it must be meaningful (>=3 alnum chars)
+        if industry_description and not is_meaningful_input(industry_description, 3):
+            st.error("❌ Please enter a meaningful Industry Description (at least 3 characters) or leave it blank.")
+            return
+        # Normalize and validate competitors
+        competitors = filter_realistic_domains(competitors)
+        if not competitors:
+            st.warning("⚠️ No valid competitors detected. Please add at least one real competitor domain.")
+            return
+        # Validate seed keywords (each must be >=3 letters/digits after normalization)
+        seed_keywords = [normalize_text_basic(k) for k in seed_keywords]
+        seed_keywords = [k for k in seed_keywords if is_meaningful_input(k, 3)]
+        if not seed_keywords:
+            st.error("❌ Please provide seed keywords (each at least 3 characters).")
+            return
         # Validation
         if not all([brand, competitors, seed_keywords, selected_platforms]):
             st.error("❌ Please complete all configuration sections")
@@ -2158,7 +2250,8 @@ def main():
             successful_responses = 0
             
             for stage_name, queries in all_generated_queries.items():
-                stage_keywords = all_extracted_keywords.get(stage_name, [])
+                # Use user-provided seed keywords for scoring (per requirement)
+                stage_keywords = seed_keywords
                 
                 for query in queries:
                     for platform in selected_platforms:
@@ -2184,7 +2277,7 @@ def main():
                                     'platform': platform,
                                     'stage': stage_name,
                                     'brand_mentions': mentions_data,
-                                    'citations': mentions_data,
+                                    'citations': [m for m in mentions_data if _is_verified_citation(m)],
                                     'timestamp': datetime.now()
                                 }
                                 query_details_data.append(query_detail)
@@ -2196,7 +2289,7 @@ def main():
                                         query=query,
                                         response=ai_response,
                                         brand_mentions=mentions_data,
-                                        citations=mentions_data,
+                                        citations=[m for m in mentions_data if _is_verified_citation(m)],
                                         platform=platform,
                                         stage=stage_name
                                     )
