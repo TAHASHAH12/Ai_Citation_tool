@@ -1,4 +1,5 @@
 import streamlit as st
+import os
 from openai import OpenAI
 import pandas as pd
 import re
@@ -274,8 +275,50 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Initialize OpenAI client
+
 @st.cache_resource
 def init_openai_client():
+    """Initialize OpenAI client with error handling (from appback.py logic)"""
+    try:
+        # Prefer Streamlit secrets, fallback to env var
+        api_key = None
+        try:
+            api_key = st.secrets.get("OPENAI_API_KEY")
+        except Exception:
+            api_key = None
+        if not api_key:
+            import os
+            api_key = os.getenv("OPENAI_API_KEY")
+
+        if not api_key:
+            return None
+
+        client = OpenAI(
+            api_key=api_key,
+            timeout=30.0,
+            max_retries=2
+        )
+
+        # Quick connectivity test (low cost)
+        try:
+            _ = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=3
+            )
+        except Exception:
+            # Even if the ping fails transiently, we still return client
+            pass
+
+        return client
+
+    except Exception as e:
+        try:
+            st.error(f"OpenAI client initialization failed: {str(e)}")
+        except Exception:
+            pass
+        return None
+
     """Initialize OpenAI client with error handling"""
     try:
         if "OPENAI_API_KEY" not in st.secrets:
@@ -2116,6 +2159,52 @@ def main():
                 help="Select AI platforms for analysis"
             )
             
+
+            # === Added: Per-platform API key checks on selection (no trigger on first load) ===
+            def _has_any_key(keys):
+                for k in keys:
+                    try:
+                        if k in st.secrets and st.secrets.get(k):
+                            return True
+                    except Exception:
+                        pass
+                    import os
+                    if os.getenv(k):
+                        return True
+                return False
+
+            _platform_key_map = {
+                "ChatGPT": ["OPENAI_API_KEY"],
+                "Claude": ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
+                "Gemini": ["GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_API_KEY"],
+                "Perplexity": ["PERPLEXITY_API_KEY", "PPLX_API_KEY"]
+            }
+
+            # Show missing-key messages only when the selection changes (avoid on first load)
+            prev_sel = st.session_state.get('prev_selected_platforms', None)
+            if prev_sel is not None:
+                newly_selected = [p for p in selected_platforms if p not in prev_sel]
+                for _plat in newly_selected:
+                    req = _platform_key_map.get(_plat, [])
+                    if req and not _has_any_key(req):
+                        st.error(f"{_plat} API not found")
+            st.session_state.prev_selected_platforms = list(selected_platforms)
+
+            # Auto-disable platforms without keys
+            valid_platforms = []
+            missing_platforms = []
+            for _plat in selected_platforms:
+                req = _platform_key_map.get(_plat, [])
+                if req and _has_any_key(req):
+                    valid_platforms.append(_plat)
+                elif req:
+                    missing_platforms.append(_plat)
+                else:
+                    valid_platforms.append(_plat)  # keep unknown for back-compat
+            if missing_platforms:
+                st.warning("Auto-disabled due to missing API keys: " + ", ".join(missing_platforms))
+            selected_platforms = valid_platforms
+            # === End Added ===
             # Analysis scope
             total_queries = 5 * queries_per_stage  # 5 stages
             total_responses = total_queries * len(selected_platforms)
@@ -2216,6 +2305,11 @@ def main():
             tracker.start_tracking(total_work_items)
             
             st.success("🚀 Starting analysis with FIXED unique keyword tracking...")
+
+            # ✅ Show per-platform success toasts now (only when analysis actually starts)
+            for _plat in selected_platforms:
+                st.success("✅ OpenAI client initialized successfully")
+    
             
             all_results = []
             all_generated_queries = {}
@@ -2330,6 +2424,32 @@ def main():
             
             if all_results:
                 results_df = pd.DataFrame(all_results)
+
+                # === Added: Derive a robust 'citation_url' column (non-breaking) ===
+                if 'citation_url' not in results_df.columns:
+                    url_pattern = re.compile(r'(https?://[^\s\]\)>,]+)')
+                    def _first_url(s):
+                        if isinstance(s, str):
+                            m = url_pattern.search(s)
+                            if m:
+                                return m.group(1)
+                        return None
+                    if 'citation_text' in results_df.columns:
+                        results_df['citation_url'] = results_df['citation_text'].apply(_first_url)
+                    else:
+                        results_df['citation_url'] = None
+                    # Fallback from domain
+                    def _fallback_url(row):
+                        url = row.get('citation_url')
+                        if isinstance(url, str) and url:
+                            return url
+                        dom = str(row.get('citation_domain') or '').strip()
+                        if dom:
+                            dom = dom.lower().lstrip('www.')
+                            return f"https://{dom}"
+                        return None
+                    results_df['citation_url'] = results_df.apply(_fallback_url, axis=1)
+                # === End Added ===
                 enhanced_metrics = calculate_enhanced_metrics(results_df, brand, competitors)
                 
                 st.session_state.results_df = results_df
@@ -2496,6 +2616,53 @@ def main():
             # Enhanced export functionality with FIXED keyword data
             st.markdown("### 📥 Enhanced Export Options with FIXED Data")
             
+
+            # === Added: Domain citation threshold alert with links & CSV ===
+            st.markdown("#### 🔗 Domain Citation Links (Threshold Alert)")
+            domain_for_threshold = st.text_input("Domain to watch", value="reddit.com", key="domain_threshold")
+            threshold_n = st.number_input("Show links when count ≥", min_value=1, value=50, step=1, key="threshold_n")
+            if 'results_df' in locals() and isinstance(results_df, pd.DataFrame) and not results_df.empty and domain_for_threshold:
+                mask = results_df['citation_domain'].fillna('').str.contains(domain_for_threshold, case=False, na=False)
+                count = int(mask.sum())
+                st.caption(f"Current count for {domain_for_threshold}: {count}")
+                if count >= threshold_n:
+                    links_series = results_df.loc[mask, 'citation_url'].fillna('')
+                    # Fallback: parse from citation_text if needed
+                    url_pattern = re.compile(r'(https?://[^\s\]\)>,]+)')
+                    def _extract_from_text(s):
+                        if isinstance(s, str):
+                            m = url_pattern.search(s)
+                            if m:
+                                return m.group(1)
+                        return ''
+                    missing = links_series.eq('')
+                    if missing.any() and 'citation_text' in results_df.columns:
+                        extracted = results_df.loc[mask & missing, 'citation_text'].apply(_extract_from_text)
+                        links_series.loc[missing] = extracted
+                    # Last resort from domain
+                    still_missing = links_series.eq('')
+                    if still_missing.any():
+                        synth = "https://" + results_df.loc[mask & still_missing, 'citation_domain'].astype(str).str.lower().str.lstrip('www.')
+                        links_series.loc[still_missing] = synth
+                    # Unique preserve order
+                    seen = set()
+                    unique_links = []
+                    for u in links_series.tolist():
+                        if u and u not in seen:
+                            seen.add(u)
+                            unique_links.append(u)
+                    st.success(f"✅ Threshold met: {count} citations from {domain_for_threshold}. Showing {len(unique_links)} unique links:")
+                    for url in unique_links[:200]:
+                        st.markdown(f"- [{url}]({url})")
+                    links_csv = pd.DataFrame({'link': unique_links}).to_csv(index=False)
+                    st.download_button(
+                        label=f"⬇️ Download {domain_for_threshold} links (CSV)",
+                        data=links_csv,
+                        file_name=f"{domain_for_threshold.replace('.', '_')}_links_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+            # === End Added ===
             col1, col2 = st.columns(2)
             
             with col1:
