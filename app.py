@@ -2055,8 +2055,8 @@ def display_enhanced_analysis_results(df, metrics, brand, competitors, client):
 
 # Main application
 def main():
-    st.markdown('<h1 class="main-header">AI Citation Tracker Pro - FIXED</h1>', unsafe_allow_html=True)
-    st.markdown("**Complete xFunnel.ai + BrandRadar.ai with FIXED unique keyword tracking - no more duplicate data!**")
+    st.markdown('<h1 class="main-header">AI Citation Tracker Pro </h1>', unsafe_allow_html=True)
+    st.markdown("**Complete xFunnel.ai + BrandRadar.ai with  unique keyword tracking - no more duplicate data!**")
     
     # Initialize OpenAI client
     openai_client = init_openai_client()
@@ -2709,7 +2709,7 @@ def main():
                     keyword_stats = keyword_scorer.calculate_keyword_scores()
                     opportunities = keyword_scorer.get_missed_opportunities(brand, competitors)
                     
-                    report = f"""Enhanced AI Citation Tracker Pro Report - FIXED KEYWORD TRACKING
+                    report = f"""Enhanced AI Citation Tracker Pro Report - KEYWORD TRACKING
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 Brand: {brand}
@@ -2770,7 +2770,7 @@ BRAND METRICS:
     
     # Enhanced welcome screen with FIXED features
     else:
-        st.info("🚀 **Welcome to AI Citation Tracker Pro - Now with FIXED Keyword Tracking!**")
+        st.info("🚀 **Welcome to AI Citation Tracker Pro - Now with Keyword Tracking!**")
         
         st.markdown("""
         ### ✅ **CRITICAL FIXES APPLIED:**
@@ -2842,7 +2842,7 @@ BRAND METRICS:
         
         with col1:
             st.success("""
-            **✅ FIXED: Keyword Tracking**
+            **✅Keyword Tracking**
             
             ✅ Unique data per keyword
             ✅ No more duplicate results
